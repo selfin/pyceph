@@ -10,6 +10,7 @@ from rados import Rados
 from rados import ObjectNotFound
 import logging
 import os
+import pyaio
 
 logger = logging.getLogger(__name__)
 FORMAT = "[%(filename)s:%(lineno)s - %(funcName)20s() ] %(message)s"
@@ -110,7 +111,6 @@ class Ceph(object):
             self.ioctx = self.cluster.open_ioctx(self.pool)
             self.rbd = rbd.RBD()
         except ObjectNotFound:
-            logger.exception("Error in ceph.py")
             raise PoolNotFound("No pool %s found" % self.pool)
 
     def __enter__(self):
@@ -263,20 +263,41 @@ class Ceph(object):
         if not self.is_snapshot_exists(image_name, snap_name):
             logger.warn("No snapshot %s for image %s exists in cluster", snap_name, image_name)
             return False
-        with rbd.Image(self.ioctx, image_name, snapshot=snap_name) as image, open(fn, "wb") as fd:
+
+        import ctypes
+        import ctypes.util
+
+        POSIX_FADV_SEQUENTIAL = 2
+        libc = ctypes.CDLL(ctypes.util.find_library('c'))
+
+        def bufcache_seq(fd, offs, length):
+            return libc.posix_fadvise(fd, ctypes.c_uint64(offs), ctypes.c_uint64(length), POSIX_FADV_SEQUENTIAL)
+
+        fd = os.open(fn, os.O_CREAT | os.O_WRONLY)
+
+        def aio_callback(rt, _errno):
+            if rt < 0:
+                import errno
+                logger.critical("Got error: %d", errno.errorcode[_errno])
+
+        with rbd.Image(self.ioctx, image_name, snapshot=snap_name) as image:
+            bufcache_seq(fd, 0, 0)
             if not bs:
                 bs = int(1 << image.stat()['order'] * image.stripe_count())
             total = image.stat()['size']
             cur = 0
             while cur < total:
+                bs = min(bs, total - cur)
                 if bucket:
                     if bucket.consume(bs):
                         try:
-                            fd.write(image.read(cur, bs, fadvice_flags))
-                        except rbd.InvalidArgument:
-                            bs = total % bs
-                            print("cur, total: %d, %d" % (cur, total))
-                            fd.write(image.read(cur, bs, fadvice_flags))
+                            data = image.read(cur, bs, fadvice_flags)
+                            pyaio.aio_write(fd, data, cur, aio_callback)
+                        except rbd.InvalidArgument as e:
+                            # @TODO: there should be a unit-test of max(bs, total - cur), but for now we sure that I'm
+                            # good at math
+                            logger.critical("It doesn't happen!")
+                            raise e
 
                         cur += bs
                         print_progress(cur, total)
@@ -285,7 +306,9 @@ class Ceph(object):
                         sleep(1)
                 else:
                     try:
-                        fd.write(image.read(cur, bs, fadvice_flags))
+
+                        data = image.read(cur, bs, fadvice_flags)
+                        pyaio.aio_write(fd, data, cur, aio_callback)
 
                     except rbd.InvalidArgument:
                         print("cur, total: %d, %d" % (cur, total))
